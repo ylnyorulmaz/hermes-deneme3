@@ -1,519 +1,613 @@
----------------------------------------------------------------
--- deskpet v0.4 — "pet IS the device" (LÖVE 11.x)
--- Chunky pixel pet with a round belly-LCD: countdown + pie sweep.
--- Matches reference aesthetic: navy bg, tan body, cream belly,
--- brown LCD circle, pixel font. No visible buttons.
--- Controls: left-click pet = PET · right-click = FEED
---           drag body = move · Esc = quit
--- Optional art override: sprites/pet.png (2 cols x 4 rows grid)
----------------------------------------------------------------
+-- ============================================================================
+-- deskpet — a Tamagotchi-style desktop widget
+-- LÖVE2D 11.x, Lua 5.1-compatible (love2d bundles Lua 5.1).
+-- ============================================================================
 
-local W, H = 240, 280
-local SETTINGS = "settings.txt"
+-- ---------------------------------------------------------------------------
+-- 0. State container & tunables
+-- ---------------------------------------------------------------------------
 
--- tuning
-local HUNGER_INTERVAL = 30    -- real seconds per -1 hunger (the LCD countdown)
-local SLEEP_AFTER     = 300   -- idle seconds before Zzz
+local PET = {
+    -- hunger: 0 = starving, 10 = full. Drains 1 every 30s.
+    hunger       = 10,
+    -- affection: 0..10, raised by petting. Decays very slowly.
+    affection    = 5,
+    -- time bookkeeping
+    last_tick    = 0,        -- love timer time at last hunger tick
+    last_pet     = 0,        -- for idle / sleep
+    last_action  = 0,        -- for any activity timeout
+    born_at      = 0,        -- for "day N" / growth (future hook)
 
--- state
-local hunger, hungerTimer = 8, 0
-local anim        = { name = "idle", t = 0, dur = 0 }
-local blinkTimer  = love.math.random(3, 8)
-local blinking    = 0
-local lastTouch   = 0
-local sleeping    = false
-local whined      = false
-local dragging, dragMoved = false, 0
-local grabX, grabY = 0, 0
-local petScale    = 2
+    -- transient effects
+    shake_t      = 0,        -- remaining shake seconds
+    hop_t        = 0,        -- remaining hop seconds (pet bounce)
+    eat_anim_t   = 0,        -- eat animation remaining
+    blink_t      = 0,        -- blink overlay remaining
+    blink_next   = 2,        -- next blink in seconds
 
--- layout (pet art is a 96x96 grid, drawn at petScale)
-local petPX, petPY = 24, 24                    -- 96*2 = 192px, centered
-local iconPet  = { x = 24,  y = 240, w = 28, h = 28 }   -- heart = pet
-local iconFeed = { x = 188, y = 240, w = 28, h = 28 }   -- meat = feed
+    -- particles
+    particles    = {},
 
--- palette (from your refs)
-local PAL = {
-    outline = { 0.10, 0.11, 0.17 },   -- dark navy silhouette
-    body    = { 0.89, 0.64, 0.39 },   -- tan fur
-    shade   = { 0.76, 0.51, 0.29 },   -- fur shadow
-    cream   = { 0.97, 0.92, 0.83 },   -- belly patch
-    lcd     = { 0.40, 0.26, 0.14 },   -- brown LCD circle
-    lcdPie  = { 0.64, 0.44, 0.20 },   -- timer sweep wedge
-    pink    = { 0.94, 0.63, 0.66 },   -- cheeks, hearts, inner ear
-    white   = { 0.98, 0.96, 0.90 },   -- LCD text
-    dim     = { 0.75, 0.68, 0.58 },   -- tiny labels
-    pipOff  = { 0.23, 0.24, 0.32 },   -- empty hunger pips
+    -- positioning
+    x, y         = 100, 100, -- window position
+    drag_off     = nil,     -- {dx, dy} while dragging
+
+    -- affection lean: target lean angle (radians)
+    lean         = 0,
+
+    -- save path
+    save_path    = "deskpet.save",
 }
 
----------------------------------------------------------------
--- 3x5 pixel font + icons
----------------------------------------------------------------
-local FONT = {
-    ["0"] = { "111","101","101","101","111" },
-    ["1"] = { "010","110","010","010","111" },
-    ["2"] = { "111","001","111","100","111" },
-    ["3"] = { "111","001","111","001","111" },
-    ["4"] = { "101","101","111","001","001" },
-    ["5"] = { "111","100","111","001","111" },
-    ["6"] = { "111","100","111","101","111" },
-    ["7"] = { "111","001","010","010","010" },
-    ["8"] = { "111","101","111","101","111" },
-    ["9"] = { "111","101","111","001","111" },
-    [":"] = { "0","1","0","1","0" },
-    A = { "010","101","111","101","101" },
-    D = { "110","101","101","101","110" },
-    E = { "111","100","111","100","111" },
-    F = { "111","100","111","100","100" },
-    O = { "111","101","101","101","111" },
-    T = { "111","010","010","010","010" },
-    Z = { "111","001","010","100","111" },
-}
-local HEART = { "01010","11111","11111","01110","00100" }
-local MEAT  = {
-    "..mmmm..",
-    ".mmmmmm.",
-    "mmmmmmmm",
-    "mmmmmmmm",
-    ".mmmmmm.",
-    "..mmbb..",
-    "...mb...",
-    "...bb...",
+local CFG = {
+    max_hunger    = 10,
+    hunger_drain  = 30.0,   -- seconds per hunger tick
+    feed_gain     = 2,
+    pet_aff_gain  = 1,
+    aff_decay     = 60.0,   -- seconds per affection point of decay
+    idle_sleep    = 300,    -- 5 minutes
+    hop_dur       = 0.18,
+    shake_dur     = 0.25,
+    eat_dur       = 0.7,
+    blink_dur     = 0.12,
 }
 
-local function pxMap(map, x, y, s, col)
-    love.graphics.setColor(col)
-    for r = 1, #map do
-        local row = map[r]
-        for c = 1, #row do
-            local ch = row:sub(c, c)
-            if ch ~= "." and ch ~= "0" and ch ~= " " then
-                if ch == "b" then love.graphics.setColor(PAL.cream) end
-                love.graphics.rectangle("fill", x + (c - 1) * s, y + (r - 1) * s, s, s)
-                love.graphics.setColor(col)
-            end
-        end
-    end
-end
+-- derived display state
+local VIS = {
+    width   = 256,
+    height  = 256,
+    pet_r   = 96,                  -- radius of the round body
+    pet_cx  = 128,
+    pet_cy  = 140,                 -- body sits below center to leave room for ears/hat
+    lcd_cx  = 128,
+    lcd_cy  = 152,
+    lcd_r   = 56,
+    bg      = {0.07, 0.10, 0.18},  -- dark navy
+    body    = {0.86, 0.62, 0.36},  -- tan/orange
+    belly   = {0.96, 0.89, 0.74},  -- cream
+    lcd_bg  = {0.36, 0.21, 0.10},  -- brown LCD
+    lcd_fg  = {0.95, 0.88, 0.55},  -- LCD pixel text
+    heart   = {0.95, 0.32, 0.42},
+}
 
-local function textW(str, s)
-    local w = 0
-    for i = 1, #str do
-        local g = FONT[str:sub(i, i)]
-        w = w + (g and #g[1] or 2) + 1
-    end
-    return (w - 1) * s
-end
+-- ---------------------------------------------------------------------------
+-- 1. Pixel-art assets, drawn procedurally into canvases on love.load
+--    Keeps the folder at ~few KB; no PNG sprite sheet required.
+-- ---------------------------------------------------------------------------
 
-local function pxText(str, x, y, s, col)
-    local cx = x
-    for i = 1, #str do
-        local g = FONT[str:sub(i, i)]
-        if g then
-            pxMap(g, cx, y, s, col)
-            cx = cx + (#g[1] + 1) * s
-        else
-            cx = cx + 3 * s
-        end
-    end
-end
+local SPR = {}   -- sprite canvases
 
-local function pxTextCentered(str, cx, y, s, col)
-    pxText(str, cx - textW(str, s) / 2, y, s, col)
-end
-
----------------------------------------------------------------
--- placeholder pet (96x96 chunky pixel cat, generated in code)
----------------------------------------------------------------
-local function makeFrame(kind)
-    local S = 96
-    local id = love.image.newImageData(S, S)
-    local O, T, SH, P, D = PAL.outline, PAL.body, PAL.shade, PAL.pink, PAL.outline
-
-    local function px(x, y, c)
-        if x >= 0 and x < S and y >= 0 and y < S then
-            id:setPixel(x, y, c[1], c[2], c[3], 1)
-        end
-    end
-    local function disc(cx, cy, r, c)
-        for y = math.floor(cy - r), math.ceil(cy + r) do
-            for x = math.floor(cx - r), math.ceil(cx + r) do
-                local dx, dy = x - cx, y - cy
-                if dx * dx + dy * dy <= r * r then px(x, y, c) end
-            end
-        end
-    end
-    local function rect(x0, y0, x1, y1, c)
-        for y = y0, y1 do for x = x0, x1 do px(x, y, c) end end
-    end
-    local function ear(cx, y0, y1, hl, hr, c)
-        for y = y0, y1 do
-            local t = (y - y0) / (y1 - y0)
-            for x = math.floor(cx - hl * t), math.ceil(cx + hr * t) do px(x, y, c) end
-        end
-    end
-    local function inRRect(x, y, x0, y0, x1, y1, r)
-        if x < x0 or x > x1 or y < y0 or y > y1 then return false end
-        local dx = math.max(x0 + r - x, x - (x1 - r), 0)
-        local dy = math.max(y0 + r - y, y - (y1 - r), 0)
-        return dx * dx + dy * dy <= r * r
-    end
-
-    -- feet (behind body)
-    disc(30, 92, 8, O) disc(66, 92, 8, O)
-    disc(30, 92, 6, T) disc(66, 92, 6, T)
-    -- pointy ears: outline / tan / pink inner
-    ear(27, 2, 24, 15, 11, O)  ear(69, 2, 24, 11, 15, O)
-    ear(27, 6, 23, 11, 8, T)   ear(69, 6, 23, 8, 11, T)
-    ear(27, 11, 21, 6, 4, P)   ear(69, 11, 21, 4, 6, P)
-    -- barrel body + outline, darker toward the bottom
-    for y = 0, S - 1 do for x = 0, S - 1 do
-        if inRRect(x, y, 8, 14, 88, 94, 26) then px(x, y, O) end
-    end end
-    for y = 0, S - 1 do for x = 0, S - 1 do
-        if inRRect(x, y, 11, 17, 85, 91, 23) then
-            px(x, y, (y >= 82) and SH or T)
-        end
-    end end
-    -- belly patch + brown LCD circle with navy ring
-    disc(48, 63, 27, PAL.cream)
-    disc(48, 63, 21, O)
-    disc(48, 63, 19, PAL.lcd)
-    -- cheeks + whiskers
-    rect(14, 41, 21, 46, P)  rect(75, 41, 82, 46, P)
-    rect(4, 42, 12, 43, D)   rect(4, 48, 12, 49, D)
-    rect(84, 42, 92, 43, D)  rect(84, 48, 92, 49, D)
-    -- eyes
-    if kind == "blink" or kind == "sleep" then
-        rect(24, 33, 34, 36, D) rect(62, 33, 72, 36, D)
-    elseif kind == "happy" then
-        for i = 0, 5 do                          -- ^^ eyes
-            local ly = 36 - math.floor(2.4 * math.sin(math.pi * i / 5))
-            rect(24 + i, ly, 25 + i, ly + 1, D)
-            rect(67 + i, ly, 68 + i, ly + 1, D)
-        end
-    else
-        rect(24, 28, 34, 38, D) rect(62, 28, 72, 38, D)
-        rect(30, 30, 32, 32, PAL.white) rect(68, 30, 70, 32, PAL.white)
-    end
-    -- nose + mouth
-    rect(46, 41, 49, 43, D)
-    if kind == "eat" then
-        disc(48, 48, 5, D)
-        rect(46, 50, 49, 52, P)                  -- tongue
-    elseif kind == "sad" then
-        for i = 0, 8 do                          -- frown
-            local dy = (i % 2 == 0) and 1 or 0
-            px(44 + i, 46 + dy, D) px(44 + i, 47 + dy, D)
-        end
-    elseif kind == "happy" then
-        disc(48, 47, 3, D)
-    else
-        for i = 0, 8 do                          -- little "w" mouth
-            local dy = (i % 2 == 0) and 0 or 1
-            px(44 + i, 45 + dy, D) px(44 + i, 46 + dy, D)
-        end
-    end
-
-    local img = love.graphics.newImage(id)
-    img:setFilter("nearest", "nearest")
-    return img
-end
-
-local Frames = {}
-
----------------------------------------------------------------
--- sprite loading: sprites/pet.png with procedural fallback
--- Sheet: square cells, 2 columns x 4 rows (any cell size):
---   (0,0) idle   (1,0) blink
---   (0,1) eat1   (1,1) eat2
---   (0,2) happy1 (1,2) happy2
---   (0,3) sad    (1,3) sleep
--- IMPORTANT for the LCD overlay to line up: draw your pet's belly
--- circle centered at 50% / 65.6% of the cell, radius ~20% of cell
--- (that's the (48,63) r19 spot on the 96x96 placeholder grid).
----------------------------------------------------------------
-local FRAME_PX = 96
-
-local function sheetFrame(sheet, col, row, fs)
-    local q = love.graphics.newQuad(col * fs, row * fs, fs, fs, sheet:getDimensions())
-    local c = love.graphics.newCanvas(fs, fs)
-    c:setFilter("nearest", "nearest")
+-- A "chunky pixel" frame for the pet: round body + cat ears + face + belly patch.
+local function make_pet_frame(opts)
+    opts = opts or {}
+    local mood = opts.mood or "idle"   -- "idle" | "eat" | "sad" | "sleep" | "pet"
+    local size = 192
+    local c = love.graphics.newCanvas(size, size)
     love.graphics.setCanvas(c)
     love.graphics.clear(0, 0, 0, 0)
-    love.graphics.setColor(1, 1, 1)
-    love.graphics.draw(sheet, q, 0, 0)
+
+    -- ears (triangles)
+    love.graphics.setColor(VIS.body)
+    love.graphics.polygon("fill",
+        60, 60,  78, 18,  96, 56)        -- left ear
+    love.graphics.polygon("fill",
+        132, 56, 150, 18, 168, 60)       -- right ear
+    love.graphics.setColor(0.55, 0.36, 0.18)
+    love.graphics.polygon("fill",
+        70, 56,  82, 30,  90, 54)        -- inner left ear
+    love.graphics.polygon("fill",
+        138, 54, 146, 30, 158, 56)       -- inner right ear
+
+    -- body (round)
+    love.graphics.setColor(VIS.body)
+    love.graphics.circle("fill", size/2, size/2 + 8, 72)
+
+    -- belly (cream patch)
+    love.graphics.setColor(VIS.belly)
+    love.graphics.circle("fill", size/2, size/2 + 18, 46)
+
+    -- outline
+    love.graphics.setColor(0.20, 0.12, 0.06)
+    love.graphics.setLineWidth(2)
+    love.graphics.circle("line", size/2, size/2 + 8, 72)
+    love.graphics.circle("line", size/2, size/2 + 18, 46)
+    love.graphics.setLineWidth(1)
+
+    -- eyes (position depends on mood)
+    love.graphics.setColor(0.10, 0.06, 0.04)
+    if mood == "sleep" then
+        love.graphics.line(size/2 - 18, size/2 - 2, size/2 - 8,  size/2 - 2)
+        love.graphics.line(size/2 + 8,  size/2 - 2, size/2 + 18, size/2 - 2)
+    elseif mood == "sad" then
+        love.graphics.circle("fill", size/2 - 14, size/2 + 0, 3)
+        love.graphics.circle("fill", size/2 + 14, size/2 + 0, 3)
+    else
+        love.graphics.circle("fill", size/2 - 14, size/2 - 6, 3)
+        love.graphics.circle("fill", size/2 + 14, size/2 - 6, 3)
+        -- eye shine
+        love.graphics.setColor(1, 1, 1)
+        love.graphics.rectangle("fill", size/2 - 12, size/2 - 8, 1, 1)
+        love.graphics.rectangle("fill", size/2 + 16, size/2 - 8, 1, 1)
+    end
+
+    -- mouth
+    love.graphics.setColor(0.20, 0.10, 0.06)
+    if mood == "eat" then
+        love.graphics.arc("fill", size/2, size/2 + 14, 6, 0, math.pi)
+    elseif mood == "sad" then
+        love.graphics.arc("line", size/2, size/2 + 14, 5, math.pi, 2 * math.pi)
+    elseif mood == "sleep" then
+        love.graphics.arc("line", size/2, size/2 + 14, 4, 0, math.pi)
+    else
+        love.graphics.arc("fill", size/2, size/2 + 8, 3, 0, math.pi)
+    end
+
+    -- whiskers
+    love.graphics.setColor(0.20, 0.10, 0.06)
+    love.graphics.line(size/2 - 22, size/2 + 10, size/2 - 38, size/2 + 6)
+    love.graphics.line(size/2 + 22, size/2 + 10, size/2 + 38, size/2 + 6)
+    love.graphics.line(size/2 - 22, size/2 + 14, size/2 - 38, size/2 + 18)
+    love.graphics.line(size/2 + 22, size/2 + 14, size/2 + 38, size/2 + 18)
+
+    -- blink overlay (drawn as a dark bar across eyes) — used for pet blinks
+    if mood == "blink" then
+        love.graphics.setColor(0.10, 0.06, 0.04)
+        love.graphics.rectangle("fill", size/2 - 22, size/2 - 8, 44, 4)
+    end
+
+    -- "EAT" prompt when sad & hungry — small pixel text above head
+    if mood == "sad" then
+        love.graphics.setColor(0.95, 0.32, 0.32)
+        love.graphics.printf("EAT", 0, 18, size, "center")
+    end
+
     love.graphics.setCanvas()
     return c
 end
 
-local function loadFrames()
-    local path = "sprites/pet.png"
-    if love.filesystem.getInfo(path) then
-        local sheet = love.graphics.newImage(path)
-        sheet:setFilter("nearest", "nearest")
-        local fs   = math.floor(sheet:getHeight() / 4)
-        local cols = math.floor(sheet:getWidth() / fs)
-        assert(fs > 0 and cols >= 1,
-            "pet.png must be a grid with 4 rows (see layout comment)")
-        FRAME_PX = fs
-        local function f(col, row) return sheetFrame(sheet, col, row, fs) end
-        Frames.idle  = f(0, 0)
-        Frames.blink = (cols > 1) and f(1, 0) or f(0, 0)
-        Frames.eat   = { f(0, 1) }
-        Frames.happy = { f(0, 2) }
-        if cols > 1 then
-            Frames.eat[2]   = f(1, 1)
-            Frames.happy[2] = f(1, 2)
+local function make_icon(kind)
+    -- A 32x32 icon for the "meat" / "heart" badge we draw in a corner.
+    local size = 32
+    local c = love.graphics.newCanvas(size, size)
+    love.graphics.setCanvas(c)
+    love.graphics.clear(0, 0, 0, 0)
+    if kind == "meat" then
+        love.graphics.setColor(0.78, 0.30, 0.30)
+        love.graphics.circle("fill", 14, 14, 10)
+        love.graphics.setColor(1, 0.95, 0.85)
+        love.graphics.circle("fill", 16, 12, 4)
+        love.graphics.setColor(0.30, 0.15, 0.10)
+        love.graphics.circle("line", 14, 14, 10)
+    elseif kind == "heart" then
+        love.graphics.setColor(VIS.heart)
+        love.graphics.polygon("fill",
+            16, 26, 4, 14, 8, 6, 14, 6, 16, 12,
+            18, 6, 24, 6, 28, 14)
+    end
+    love.graphics.setCanvas()
+    return c
+end
+
+local function pet_sprite()
+    local mood
+    if PET.hunger <= 3 then mood = "sad"
+    elseif PET.eat_anim_t > 0 then mood = "eat"
+    elseif (love.timer.getTime() - PET.last_pet) > CFG.idle_sleep then mood = "sleep"
+    else mood = "idle" end
+
+    local blink = PET.blink_t > 0
+    if mood == "idle" and blink then mood = "blink" end
+    return SPR.pet[mood] or SPR.pet.idle
+end
+
+-- ---------------------------------------------------------------------------
+-- 2. Save / Load (window position, hunger, with offline decay)
+-- ---------------------------------------------------------------------------
+
+local function save_state()
+    local data = string.format("%d\n%d\n%.0f\n%.0f\n%d\n",
+        PET.hunger, PET.affection,
+        love.timer.getTime(), PET.last_tick,
+        math.floor(PET.x) * 1000 + math.floor(PET.y))
+    love.filesystem.write(PET.save_path, data)
+end
+
+local function load_state()
+    if not love.filesystem.getInfo(PET.save_path) then return end
+    local contents = love.filesystem.read(PET.save_path) or ""
+    local h, a, saved_t, last_tick, packed = contents:match("(%-?%d+)\n(%-?%d+)\n(%-?%d+%.?%d*)\n(%-?%d+%.?%d*)\n(%-?%d+)")
+    if not h then return end
+    PET.hunger    = math.max(0, math.min(CFG.max_hunger, tonumber(h) or 10))
+    PET.affection = math.max(0, math.min(10, tonumber(a) or 5))
+    PET.last_tick = tonumber(last_tick) or love.timer.getTime()
+
+    -- offline hunger decay
+    local now   = love.timer.getTime()
+    local delta = math.max(0, now - PET.last_tick)
+    local ticks = math.floor(delta / CFG.hunger_drain)
+    if ticks > 0 then
+        PET.hunger = math.max(0, PET.hunger - ticks)
+        PET.last_tick = PET.last_tick + ticks * CFG.hunger_drain
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- 3. Always-on-top (Win FFI, commented out per spec; toggleable at runtime)
+-- ---------------------------------------------------------------------------
+
+local AOT = { enabled = false, supported = false }
+local function apply_always_on_top(flag)
+    -- Windows FFI snippet (intentionally commented — the spec says "already in
+    -- the code, commented out"). Toggleable at runtime via Alt+T.
+    --[==[
+        local ffi = require("ffi")
+        ffi.cdef[[
+            HWND GetActiveWindow();
+            HWND SetWindowPos(HWND, HWND, int, int, int, int, UINT);
+        ]]
+        local user32 = ffi.load("user32")
+        local HWND_TOPMOST = ffi.cast("HWND", -1)
+        local SWP_NOMOVE = 0x0002; local SWP_NOSIZE = 0x0001
+        local hwnd = user32.GetActiveWindow()
+        user32.SetWindowPos(hwnd, flag and HWND_TOPMOST or ffi.cast("HWND", 0),
+            0, 0, 0, 0, SWP_NOMOVE + SWP_NOSIZE)
+        AOT.supported = true
+        --]==]
+        AOT.enabled = flag
+    end
+
+-- ---------------------------------------------------------------------------
+-- 4. Particles
+-- ---------------------------------------------------------------------------
+
+local function spawn_crumbs(x, y)
+    for _ = 1, 12 do
+        table.insert(PET.particles, {
+            x = x, y = y,
+            vx = (math.random() - 0.5) * 80,
+            vy = -math.random() * 60 - 20,
+            life = 0.6 + math.random() * 0.3,
+            age  = 0,
+            size = 2,
+            color = {0.78, 0.55, 0.30},
+        })
+    end
+end
+
+local function spawn_hearts(x, y)
+    for _ = 1, 5 do
+        table.insert(PET.particles, {
+            x = x + (math.random() - 0.5) * 20,
+            y = y,
+            vx = (math.random() - 0.5) * 30,
+            vy = -math.random() * 40 - 10,
+            life = 0.8, age = 0,
+            size = 6,
+            color = VIS.heart,
+            kind = "heart",
+        })
+    end
+end
+
+local function update_particles(dt)
+    local i = 1
+    while i <= #PET.particles do
+        local p = PET.particles[i]
+        p.age = p.age + dt
+        if p.age >= p.life then
+            table.remove(PET.particles, i)
+        else
+            p.x = p.x + p.vx * dt
+            p.y = p.y + p.vy * dt
+            p.vy = p.vy + 120 * dt   -- light gravity on crumbs
+            i = i + 1
         end
-        Frames.sad   = f(0, 3)
-        Frames.sleep = (cols > 1) and f(1, 3) or f(0, 3)
-    else
-        FRAME_PX = 96
-        Frames.idle  = makeFrame("idle")
-        Frames.blink = makeFrame("blink")
-        Frames.eat   = { makeFrame("eat") }
-        Frames.happy = { makeFrame("happy") }
-        Frames.sad   = makeFrame("sad")
-        Frames.sleep = makeFrame("sleep")
     end
 end
 
----------------------------------------------------------------
--- synthesized blips
----------------------------------------------------------------
-local function makeBlip(freq, dur, vol)
-    local rate = 22050
-    local sd = love.sound.newSoundData(math.floor(rate * dur), rate, 16, 1)
-    for i = 0, sd:getSampleCount() - 1 do
-        local t = i / rate
-        sd:setSample(i, math.sin(2 * math.pi * freq * t) * (1 - t / dur) * (vol or 0.35))
+local function draw_particles()
+    for _, p in ipairs(PET.particles) do
+        local a = 1 - p.age / p.life
+        love.graphics.setColor(p.color[1], p.color[2], p.color[3], a)
+        if p.kind == "heart" then
+            love.graphics.circle("fill", p.x, p.y, p.size * 0.5)
+        else
+            love.graphics.rectangle("fill", p.x, p.y, p.size, p.size)
+        end
     end
-    return love.audio.newSource(sd)
-end
-local sfxFeed, sfxPet, sfxWhine
-
----------------------------------------------------------------
--- persistence (position + hunger, with offline decay)
----------------------------------------------------------------
-local function loadSettings()
-    local s = love.filesystem.read(SETTINGS)
-    if not s then return nil end
-    local x, y, h, ts = s:match("(-?%d+),(-?%d+),(%d+),(%d+)")
-    if not x then return nil end
-    return tonumber(x), tonumber(y), tonumber(h), tonumber(ts)
 end
 
----------------------------------------------------------------
--- lifecycle
----------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- 5. Sound (synthesized blips — no external samples needed)
+-- ---------------------------------------------------------------------------
+
+local SFX = {}
+local function beep(freq, dur, vol)
+    if not love.audio then return end
+    local sr = 22050
+    local n  = math.floor(sr * dur)
+    local data = love.sound.newSoundData(n, sr, 16, 1)
+    for i = 0, n - 1 do
+        local t = i / sr
+        local env = math.min(1, (1 - t / dur) * 4)
+        data:setSample(i, math.sin(2 * math.pi * freq * t) * vol * env)
+    end
+    local src = love.audio.newSource(data)
+    src:play()
+    table.insert(SFX, src)
+end
+
+local function chirp_arpeggio()
+    -- happy chirp: C5 -> E5 -> G5
+    beep(523.25, 0.07, 0.15)
+    love.timer.sleep(0.06)
+    beep(659.25, 0.07, 0.15)
+    love.timer.sleep(0.06)
+    beep(783.99, 0.09, 0.15)
+end
+
+local function whine()
+    beep(220, 0.18, 0.10)
+    love.timer.sleep(0.10)
+    beep(196, 0.18, 0.10)
+end
+
+local function breathe()
+    beep(180 + math.random(40), 0.30, 0.04)
+end
+
+-- ---------------------------------------------------------------------------
+-- 6. LÖVE callbacks
+-- ---------------------------------------------------------------------------
+
+-- Forward declarations: the helper functions below are defined later in the
+-- file but referenced from inside these callbacks. Declaring the locals up
+-- front lets Lua resolve them as chunk-locals (not globals) at closure
+-- creation time, even though their values are filled in below.
+local draw_lcd
+local pet_action, feed_action
+
 function love.load()
-    love.graphics.setDefaultFilter("nearest", "nearest")
-    love.graphics.setBackgroundColor(0.15, 0.16, 0.23)   -- navy, like refs
+    love.window.setTitle("deskpet")
+    load_state()
 
-    loadFrames()
-    petScale = 192 / FRAME_PX
+    -- build sprites once
+    SPR.pet = {
+        idle  = make_pet_frame({mood = "idle"}),
+        blink = make_pet_frame({mood = "blink"}),
+        eat   = make_pet_frame({mood = "eat"}),
+        sad   = make_pet_frame({mood = "sad"}),
+        sleep = make_pet_frame({mood = "sleep"}),
+    }
+    SPR.meat  = make_icon("meat")
+    SPR.heart = make_icon("heart")
 
-    sfxFeed  = makeBlip(520, 0.12)
-    sfxPet   = makeBlip(880, 0.15)
-    sfxWhine = makeBlip(300, 0.25, 0.25)
-
-    local flags = { borderless = true, resizable = false, vsync = 1, highdpi = false }
-    local sx, sy, sh, sts = loadSettings()
-    if sx then
-        flags.x, flags.y = sx, sy
-        local elapsed = os.time() - sts
-        hunger = math.max(0, sh - math.floor(elapsed / HUNGER_INTERVAL))
-        hungerTimer = elapsed % HUNGER_INTERVAL
-    else
-        local dw, dh = love.window.getDesktopDimensions()
-        flags.x = dw - W - 20
-        flags.y = dh - H - 40
+    -- place window at last saved coords
+    if love.filesystem.getInfo(PET.save_path) then
+        local contents = love.filesystem.read(PET.save_path) or ""
+        local packed = contents:match("(%-?%d+)\n%-?%d+\n%-?%d+%.?%d*\n%-?%d+%.?%d*\n(%-?%d+)")
+        if packed then
+            local n = tonumber(packed)
+            PET.x = math.floor(n / 1000)
+            PET.y = n - PET.x * 1000
+            love.window.setPosition(PET.x, PET.y)
+        end
     end
-    love.window.setMode(W, H, flags)
-    love.window.setTitle("Pet")
 
-    lastTouch = love.timer.getTime()
-end
-
-local function playAnim(name, dur)
-    anim.name, anim.t, anim.dur = name, 0, dur
-end
-
-local function doFeed()
-    lastTouch = love.timer.getTime()
-    sleeping = false
-    if hunger < 10 then
-        hunger = math.min(10, hunger + 2)
-        whined = false
-        playAnim("eat", 1.2)
-        sfxFeed:stop(); sfxFeed:play()
-    else
-        playAnim("happy", 0.6)
-    end
-end
-
-local function doPet()
-    lastTouch = love.timer.getTime()
-    sleeping = false
-    playAnim("happy", 0.9)
-    sfxPet:stop(); sfxPet:play()
+    -- hide system menu bar; we want the keychain-toy vibe
+    -- (note: love.window.hide is intentionally not used so the user can
+    -- re-grab the window; drag-anywhere is the interaction model)
 end
 
 function love.update(dt)
-    local mx, my = love.mouse.getPosition()
-    local hovering = mx >= 0 and my >= 0 and mx < W and my < H
-
-    if dragging then
-        local wx, wy = love.window.getPosition()
-        love.window.setPosition(wx + mx - grabX, wy + my - grabY)
-    end
-
-    hungerTimer = hungerTimer + dt
-    while hungerTimer >= HUNGER_INTERVAL do
-        hungerTimer = hungerTimer - HUNGER_INTERVAL
-        hunger = math.max(0, hunger - 1)
-        if hunger <= 3 and not whined then
-            whined = true
-            sfxWhine:stop(); sfxWhine:play()
-        end
-    end
-
-    local adt = math.min(dt, 0.1)
-    if anim.name ~= "idle" then
-        anim.t = anim.t + adt
-        if anim.t >= anim.dur then anim.name = "idle" end
-    else
-        blinkTimer = blinkTimer - adt
-        if blinkTimer <= 0 then
-            blinking = 0.15
-            blinkTimer = love.math.random(3, 8)
-        end
-    end
-    if blinking > 0 then blinking = blinking - adt end
-
-    if not sleeping and anim.name == "idle"
-       and love.timer.getTime() - lastTouch > SLEEP_AFTER then
-        sleeping = true
-    end
-
-    if not hovering and not dragging and anim.name == "idle" then
-        love.timer.sleep(0.05)
-    end
-end
-
----------------------------------------------------------------
--- drawing
----------------------------------------------------------------
-local function inRect(x, y, r)
-    return x >= r.x and x < r.x + r.w and y >= r.y and y < r.y + r.h
-end
-
-local function drawHungerPips()
-    local pipW, gap = 8, 3
-    local total = 10 * pipW + 9 * gap
-    local x0, y0 = (W - total) / 2, 8
-    for i = 1, 10 do
-        love.graphics.setColor(i <= hunger and PAL.shade or PAL.pipOff)
-        love.graphics.rectangle("fill", x0 + (i - 1) * (pipW + gap), y0, pipW, 5)
-    end
-end
-
-local function drawLCD()
-    -- LCD position in window coords (tracks whatever pet art is loaded)
-    local cx = petPX + 48 * petScale
-    local cy = petPY + 63 * petScale
-    local r  = 16 * petScale
     local now = love.timer.getTime()
 
-    if sleeping then
-        pxTextCentered("ZZZ", cx, cy - 10, 4, PAL.dim)
-    elseif anim.name == "eat" then
-        local t = math.min(1, anim.t / 0.9)      -- food drops to the mouth
-        pxMap(MEAT, cx - 12, cy - 30 + t * 24, 3, PAL.shade)
-    elseif anim.name == "happy" then
-        local b = math.abs(math.sin(now * 10)) * 4
-        pxMap(HEART, cx - 17, cy - 8 - b, 3, PAL.pink)
-        pxMap(HEART, cx + 3,  cy - 8 - (4 - b), 3, PAL.pink)
-    elseif hunger <= 3 then
-        if (now * 1.5) % 1 < 0.6 then
-            pxTextCentered("EAT", cx, cy - 12, 5, PAL.pink)
-        end
-    else
-        -- countdown to next hunger tick + pie sweep (the ref look)
-        local frac = hungerTimer / HUNGER_INTERVAL
-        love.graphics.setColor(PAL.lcdPie)
-        love.graphics.arc("fill", "pie", cx, cy, r,
-            -math.pi / 2, -math.pi / 2 + frac * 2 * math.pi)
-        pxTextCentered("FOOD", cx, cy - 20, 2, PAL.dim)
-        local rem = math.max(0, HUNGER_INTERVAL - hungerTimer)
-        pxTextCentered(string.format("%02d:%02d",
-            math.floor(rem / 60), math.floor(rem % 60)), cx, cy - 7, 3, PAL.white)
+    -- hunger tick
+    if now - PET.last_tick >= CFG.hunger_drain and PET.hunger > 0 then
+        PET.hunger = PET.hunger - 1
+        PET.last_tick = PET.last_tick + CFG.hunger_drain
+        if PET.hunger == 3 then whine() end
     end
-end
 
-local function drawIcons()
-    local mx, my = love.mouse.getPosition()
-    local hP = inRect(mx, my, iconPet)
-    local hF = inRect(mx, my, iconFeed)
-    pxMap(HEART, iconPet.x + 6, iconPet.y + 6, 3, hP and PAL.pink or PAL.dim)
-    pxMap(MEAT, iconFeed.x + 2, iconFeed.y + 2, 3, hF and PAL.shade or PAL.pipOff)
+    -- affection drift toward lean
+    PET.lean = PET.lean + (PET.lean_target or 0 - PET.lean) * math.min(1, dt * 4)
+    -- affection decay
+    if now - (PET.last_aff_decay or now) >= CFG.aff_decay and PET.affection > 0 then
+        PET.affection = math.max(0, PET.affection - 1)
+        PET.last_aff_decay = now
+    end
+
+    -- blink schedule
+    PET.blink_next = PET.blink_next - dt
+    if PET.blink_next <= 0 then
+        PET.blink_t = CFG.blink_dur
+        PET.blink_next = 2 + math.random() * 4
+    end
+    if PET.blink_t > 0 then PET.blink_t = PET.blink_t - dt end
+
+    -- transient effects
+    if PET.shake_t > 0 then PET.shake_t = PET.shake_t - dt end
+    if PET.hop_t > 0 then PET.hop_t = PET.hop_t - dt end
+    if PET.eat_anim_t > 0 then PET.eat_anim_t = PET.eat_anim_t - dt end
+
+    -- sleep breathing every ~6s while sleeping
+    if (now - PET.last_pet) > CFG.idle_sleep then
+        if math.floor(now * 2) ~= math.floor((now - dt) * 2) then
+            if math.random() < 0.3 then breathe() end
+        end
+    end
+
+    update_particles(dt)
 end
 
 function love.draw()
-    -- pet
-    local f
-    if sleeping then f = Frames.sleep
-    elseif anim.name == "eat" then
-        f = Frames.eat[1 + math.floor(anim.t / 0.15) % #Frames.eat]
-    elseif anim.name == "happy" then
-        f = Frames.happy[1 + math.floor(anim.t / 0.15) % #Frames.happy]
-    elseif blinking > 0 then f = Frames.blink
-    elseif hunger <= 3 then f = Frames.sad
-    else f = Frames.idle end
-    local bounce = (anim.name == "happy") and -math.abs(math.sin(anim.t * 12)) * 6 or 0
-    love.graphics.setColor(1, 1, 1)
-    love.graphics.draw(f, petPX, petPY + bounce, 0, petScale, petScale)
+    -- shake offset
+    local sx = 0
+    if PET.shake_t > 0 then
+        sx = (math.random() - 0.5) * 6 * (PET.shake_t / CFG.shake_dur)
+    end
 
-    drawLCD()
-    drawHungerPips()
-    drawIcons()
+    -- background
+    love.graphics.clear(VIS.bg[1], VIS.bg[2], VIS.bg[3])
+
+    -- corner badges
+    love.graphics.setColor(1, 1, 1, 0.9)
+    love.graphics.draw(SPR.meat,  12, 12)
+    love.graphics.draw(SPR.heart, 12, VIS.height - 44)
+
+    -- pet sprite
+    local spr = pet_sprite()
+    local dx = (VIS.width - spr:getWidth()) / 2 + sx
+    local dy = (VIS.height - spr:getHeight()) / 2
+
+    -- hop on pet
+    if PET.hop_t > 0 then
+        local p = PET.hop_t / CFG.hop_dur
+        dy = dy - math.sin(p * math.pi) * 10
+    end
+
+    -- affection lean (rotation around belly)
+    if PET.lean ~= 0 then
+        love.graphics.push()
+        love.graphics.translate(VIS.pet_cx, VIS.pet_cy)
+        love.graphics.rotate(PET.lean)
+        love.graphics.translate(-VIS.pet_cx, -VIS.pet_cy)
+        love.graphics.draw(spr, dx, dy)
+        love.graphics.pop()
+    else
+        love.graphics.draw(spr, dx, dy)
+    end
+
+    -- LCD belly patch (drawn over body so it sits on the cream patch)
+    draw_lcd()
+
+    -- particles
+    draw_particles()
+
+    -- ZZZ when sleeping
+    if (love.timer.getTime() - PET.last_pet) > CFG.idle_sleep then
+        love.graphics.setColor(0.9, 0.9, 1.0, 0.8)
+        love.graphics.printf("z z z", VIS.pet_cx - 30, 20, 60, "center")
+    end
 end
 
----------------------------------------------------------------
--- input
----------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- 7. LCD with countdown + pie sweep
+-- ---------------------------------------------------------------------------
+
+function draw_lcd()  -- assigns into the forward-declared local above
+    local cx, cy, r = VIS.lcd_cx, VIS.lcd_cy, VIS.lcd_r
+    love.graphics.setColor(VIS.lcd_bg)
+    love.graphics.circle("fill", cx, cy, r)
+    love.graphics.setColor(0.20, 0.10, 0.04)
+    love.graphics.setLineWidth(2)
+    love.graphics.circle("line", cx, cy, r)
+
+    -- pie sweep — full at last tick, empty as we approach next tick
+    local elapsed = love.timer.getTime() - PET.last_tick
+    local frac    = math.min(1, elapsed / CFG.hunger_drain)
+    if PET.hunger > 0 then
+        love.graphics.setColor(0.55, 0.40, 0.20, 0.8)
+        love.graphics.arc("fill", cx, cy, r - 4,
+            -math.pi / 2, -math.pi / 2 + (1 - frac) * 2 * math.pi)
+    end
+
+    -- countdown text
+    local secs_left = math.max(0, math.ceil(CFG.hunger_drain - elapsed))
+    love.graphics.setColor(VIS.lcd_fg)
+    love.graphics.printf(tostring(secs_left),
+        cx - r, cy - 8, r * 2, "center")
+
+    -- affection under LCD
+    love.graphics.setColor(VIS.heart)
+    local aff_str = string.rep("v", PET.affection)
+    love.graphics.printf(aff_str, cx - r, cy + r - 10, r * 2, "center")
+end
+
+-- ---------------------------------------------------------------------------
+-- 8. Input — drag, feed, pet, AOT toggle, quit
+-- ---------------------------------------------------------------------------
+
 function love.mousepressed(x, y, button)
-    if button == 2 then doFeed() return end       -- right-click = feed
-    if button ~= 1 then return end
-    if inRect(x, y, iconFeed) then doFeed() return end
-    if inRect(x, y, iconPet)  then doPet()  return end
-    dragging, dragMoved = true, 0
-    grabX, grabY = x, y
-end
+    local now = love.timer.getTime()
 
-function love.mousemoved(x, y, dx, dy)
-    if dragging then dragMoved = dragMoved + math.abs(dx) + math.abs(dy) end
+    -- dragging: any button on the body starts a drag
+    local body_x, body_y = VIS.pet_cx, VIS.pet_cy
+    if (x - body_x)^2 + (y - body_y)^2 <= (VIS.pet_r + 10)^2 then
+        if button == 1 then
+            -- left click = pet (not drag) — only drag on right click
+            pet_action(x, y)
+        elseif button == 2 then
+            PET.drag_off = { dx = x, dy = y }
+            feed_action(x, y)
+        end
+    else
+        -- click outside body: right = feed, left = nothing
+        if button == 2 then feed_action(x, y) end
+    end
 end
 
 function love.mousereleased(x, y, button)
-    if button ~= 1 then return end
-    -- click (not drag) on the pet body = pet it
-    if dragging and dragMoved < 5
-       and x >= petPX and x < petPX + 192
-       and y >= petPY and y < petPY + 192 then
-        doPet()
+    if button == 2 then PET.drag_off = nil end
+end
+
+function love.mousemoved(x, y, dx, dy)
+    if PET.drag_off then
+        local px, py = love.window.getPosition()
+        love.window.setPosition(px + dx, py + dy)
+        PET.x, PET.y = love.window.getPosition()
     end
-    dragging = false
+
+    -- affection-target lean: bias toward cursor when happy
+    if PET.affection >= 6 then
+        PET.lean_target = (x - VIS.pet_cx) / 200
+    else
+        PET.lean_target = 0
+    end
 end
 
 function love.keypressed(key)
-    if key == "escape" or key == "q" then love.event.quit() end
-    if key == "f" then doFeed() end
+    if key == "escape" then
+        save_state()
+        love.event.quit()
+    elseif key == "f" then
+        feed_action(0, 0)
+    elseif key == "p" then
+        pet_action(VIS.pet_cx, VIS.pet_cy)
+    elseif key == "t" then
+        -- Alt+T toggles always-on-top
+        apply_always_on_top(not AOT.enabled)
+    end
 end
 
 function love.quit()
-    local wx, wy = love.window.getPosition()
-    love.filesystem.write(SETTINGS,
-        table.concat({ wx, wy, hunger, os.time() }, ","))
+    save_state()
+end
+
+-- ---------------------------------------------------------------------------
+-- 9. Actions
+-- ---------------------------------------------------------------------------
+
+local last_chirp = 0
+function pet_action(x, y)
+    PET.hop_t = CFG.hop_dur
+    PET.last_pet = love.timer.getTime()
+    PET.last_action = PET.last_pet
+    PET.affection = math.min(10, PET.affection + CFG.pet_aff_gain)
+    spawn_hearts(x, y)
+    if love.timer.getTime() - last_chirp > 0.4 then
+        chirp_arpeggio()
+        last_chirp = love.timer.getTime()
+    end
+end
+
+function feed_action(x, y)
+    if PET.hunger >= CFG.max_hunger then return end
+    PET.hunger = math.min(CFG.max_hunger, PET.hunger + CFG.feed_gain)
+    PET.last_tick = love.timer.getTime()
+    PET.eat_anim_t = CFG.eat_dur
+    PET.shake_t = CFG.shake_dur
+    PET.last_action = PET.last_tick
+    spawn_crumbs(x or VIS.pet_cx, y or VIS.pet_cy)
+    beep(440, 0.06, 0.20)
 end
