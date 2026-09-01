@@ -21,6 +21,7 @@ local PET = {
     -- transient effects
     shake_t      = 0,        -- remaining shake seconds
     hop_t        = 0,        -- remaining hop seconds (pet bounce)
+    bounce_t     = 0,        -- remaining bounce seconds (happy bounce)
     eat_anim_t   = 0,        -- eat animation remaining
     blink_t      = 0,        -- blink overlay remaining
     blink_next   = 2,        -- next blink in seconds
@@ -47,6 +48,7 @@ local CFG = {
     aff_decay     = 60.0,   -- seconds per affection point of decay
     idle_sleep    = 300,    -- 5 minutes
     hop_dur       = 0.18,
+    bounce_dur    = 0.5,    -- happy bounce duration
     shake_dur     = 0.25,
     eat_dur       = 0.7,
     blink_dur     = 0.12,
@@ -428,6 +430,7 @@ function love.update(dt)
     -- transient effects
     if PET.shake_t > 0 then PET.shake_t = PET.shake_t - dt end
     if PET.hop_t > 0 then PET.hop_t = PET.hop_t - dt end
+    if PET.bounce_t > 0 then PET.bounce_t = PET.bounce_t - dt end
     if PET.eat_anim_t > 0 then PET.eat_anim_t = PET.eat_anim_t - dt end
 
     -- sleep breathing every ~6s while sleeping
@@ -466,10 +469,18 @@ function love.draw()
         dy = dy - math.sin(p * math.pi) * 10
     end
 
-    -- affection lean (rotation around belly)
-    if PET.lean ~= 0 then
+    -- bounce scale (spring effect)
+    local scale = 1
+    if PET.bounce_t > 0 then
+        local p = 1 - (PET.bounce_t / CFG.bounce_dur)
+        scale = 1 + 0.2 * math.sin(p * math.pi * 4) * (1 - p)
+    end
+
+    -- affection lean (rotation around belly) & bounce scale
+    if PET.lean ~= 0 or scale ~= 1 then
         love.graphics.push()
         love.graphics.translate(VIS.pet_cx, VIS.pet_cy)
+        love.graphics.scale(scale, scale)
         love.graphics.rotate(PET.lean)
         love.graphics.translate(-VIS.pet_cx, -VIS.pet_cy)
         love.graphics.draw(spr, dx, dy)
@@ -591,6 +602,7 @@ end
 local last_chirp = 0
 function pet_action(x, y)
     PET.hop_t = CFG.hop_dur
+    PET.bounce_t = CFG.bounce_dur
     PET.last_pet = love.timer.getTime()
     PET.last_action = PET.last_pet
     PET.affection = math.min(10, PET.affection + CFG.pet_aff_gain)
